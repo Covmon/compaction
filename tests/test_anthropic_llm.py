@@ -62,7 +62,14 @@ def test_convert_cache_and_effort():
         "type": "ephemeral"
     }
     assert "temperature" not in kw
+    assert kw["tool_choice"] == {"type": "auto", "disable_parallel_tool_use": True}
     assert llm.usage.snapshot()["total"]["calls"] == 1
+
+
+def test_no_tool_choice_without_tools():
+    c = FakeClient([fake_msg()])
+    AnthropicLLM(c).create(model="m", system="s", messages=[])
+    assert "tool_choice" not in c.calls[0]
 
 
 def test_429_backoff_then_success():

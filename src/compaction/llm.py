@@ -207,6 +207,9 @@ class AnthropicLLM:
         }
         if tools:
             kw["tools"] = tools
+            # One tool call per turn: a batch of parallel read_file calls lands in one
+            # user message and can blow past context_cap before compaction can run.
+            kw["tool_choice"] = {"type": "auto", "disable_parallel_tool_use": True}
         output_config: dict[str, Any] = {}
         if self.effort:
             output_config["effort"] = self.effort
