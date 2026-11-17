@@ -285,3 +285,125 @@ fetch calls, retrieved tokens; charts as PNG in `results/`.
 
 ## Deviations
 (append here)
+
+### Harness deviations (core agent harness)
+- `Environment.pending_user_message() -> str | None` is an OPTIONAL method (agent uses `getattr`).
+  Checked after each step once tool_results are appended (and after `done()`); returned text becomes a
+  separate user message that `LiveContext.to_api_messages` merges into the tool_result user message
+  (tool_results first). It replaces the "Continue" nudge for that step.
+- `LLMResponse.content` KEEPS `thinking`/`redacted_thinking` blocks (stored in the transcript). They are
+  resent only for the latest assistant tool_use turn of an unbroken tool loop; the sole decision point is
+  `context.strip_thinking`, applied inside `to_api_messages` (so token estimates match what is sent).
+  `AnthropicLLM` retries once with all thinking stripped on a 400 that mentions "thinking".
+- `LLMResponse.input_tokens` is the uncached count as reported by the API; use `.total_input_tokens`
+  (input + cache read + cache write) for prompt size. `UsageLedger.snapshot()` returns
+  `{"by_purpose": {purpose: {calls,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,cost_usd}}, "total": {...}}`.
+- `ScriptedLLM` callable signature is `(messages, tools, purpose)`; it records requests in `.requests` and,
+  if a response reports 0 tokens, fills usage from the estimator. Helpers `text_response` / `tool_response`.
+- `AnthropicLLM(effort="low")` sends `output_config={"effort": ...}` and top-level `cache_control`; it has no
+  structured-output/JSON-schema parameter yet (the indexed strategy may add one to `create`).
+- `Transcript.append` also accepts a plain str as content. `LiveContext` gains `copy()`, `append()`,
+  `messages()` and a view-only `max_result_chars` (hard-cap fallback; the transcript is never altered).
+- `Agent(..., transcript_dir)` writes `<transcript_dir>/transcript.jsonl` (kwarg `transcript_name`); use a
+  distinct dir per run. `RunResult` gains `transcript` (the in-memory `Transcript`). `usage` is the whole
+  LLM client's ledger, so use one LLM client per run. `Agent.run` never raises: failures go in `error`
+  (`max_steps`, `refusal`, `cap_unsatisfiable...`, or the exception text).
+- Agent overwrites `CompactionEvent.tokens_before/after` with full-request estimates (system+tools+messages);
+  strategies only fill message-only estimates. Compaction is skipped unless >= 2 messages were added since the
+  previous one (prevents compaction thrash when the kept tail alone exceeds the threshold).
+- Hard cap: effective tokens = max(estimate, last reported prompt + growth). Over cap after compaction ->
+  oldest messages dropped one at a time, then tool_result bodies shrunk (view-only), `hit_cap_violation=True`;
+  if still impossible the run stops with `cap_unsatisfiable` WITHOUT sending the request.
+- `max_tokens` stop: tool_use blocks are discarded (never executed) and a synthetic "be more concise" user
+  note is added. `refusal` ends the run with `error="refusal"`.
+- `split_tail`: if the cut lands on a user message holding tool_results, the cut moves one message earlier
+  (tail starts with the assistant tool_use); a tail may start with an assistant message since strategies
+  always prepend a user message.
+- `TruncateStrategy` inserts a synthetic "[Context was truncated: N earlier messages dropped]" user note
+  (`pin_first=False` option to keep the first task message). `SummaryStrategy` skips synthetic head messages
+  (its stored previous summary stands in for them) and uses `purpose="compactor"`.
+
+### Eval tasks (`eval/world.py`, `eval/tasks.py`)
+- **Environment protocol addition**: `pending_user_message() -> str | None`, polled by the agent
+  after every step. `InvestigationEnvironment` returns the phase-2 questions exactly once, right
+  after `finish_investigation` succeeds. It also counts polls to report phase-1/phase-2 steps.
+- **Extra tool** `finish_investigation(notes)` ends phase 1. It refuses (listing the unread files)
+  while checklist files are unread, at most `max_finish_refusals=2` times, and then accepts anyway.
+  After that, `list_files` / `read_file` / `search` return
+  `"Investigation phase is over; answer from what you have retained"`. `submit_answer` called before the
+  questions are revealed returns an error, and only the first successful `submit_answer` counts.
+  `begin_phase2()` lets a harness force the question phase, for example when a step budget runs out.
+- World: 33 files (~28-30k tokens at len/3.5, 600-1160 tokens each). The brief gives the topics
+  (not the questions) and a checklist in a seeded reading order. There are 10 questions per task:
+  about 6 `early` and 4 `late`, plus 4 `multi_hop` and 6 `single_hop`. Questions are also tagged
+  `exact` or `numeric`. A question is tagged `early` when the checklist position of its
+  earliest-listed evidence file is in the first half. Every `Question` stores its `evidence`
+  paths, and `env.stats()["question_staleness"]` gives, per question, the tokens of file content
+  the agent read after it last read the oldest needed evidence file. The report can use this to
+  tag questions by the order the agent actually read files in.
+- Grading normalizes case, whitespace, surrounding quotes and punctuation, and a leading `@`. It
+  treats ISO timestamps written with `T` or a space, and ending in `Z` or `UTC`, as equal. For
+  numeric answers it compares the first number in the answer, after removing commas and currency
+  text, within an absolute tolerance (0 for integers, 0.01 for money).
+- `MockAgentPolicy(task).next_action(observation) -> (tool, input) | None` is a scripted perfect
+  agent for `--mock`. Its options are `forget_early`, `error_rate`, `wrong_qids` and `read_limit`.
+  `run_mock_episode(env, policy)` drives an environment directly, without an LLM.
+
+### Indexed Retention deviations (`strategies/index.py`, `strategies/indexed.py`)
+- `LLMClient.create` (and `AnthropicLLM` / `ScriptedLLM`) gain `output_format: dict | None = None` (a JSON
+  schema). `AnthropicLLM` sends `output_config={"format": {"type": "json_schema", "schema": ...}}`, merged with
+  `effort`; `ScriptedLLM` records it in `requests[i]["output_format"]`. The strategy retries without the kwarg on
+  `TypeError`, so older/mocked clients still work.
+- Ops schema (`index.OPS_SCHEMA`): `{"ops": [op]}`, each op ONE flat object with all fields required
+  (`op` enum, `id`, `section`, `title`, `summary`, `ranges`; unused = null), as structured outputs require
+  `additionalProperties: false`. Ranges are strings `"m0005-m0011"` / `"m0007"`; the parser also accepts
+  `["m0005","m0011"]` pairs, `{"start","end"}`, en dashes and `..`. Fallback `parse_ops` extracts JSON from
+  prose / code fences / bare op lists.
+- `add_subsection.section` may be an existing id, the exact title of a section (e.g. one added earlier in the
+  same op list), or null = the last section added in this batch. Invalid ops / ranges are skipped and
+  reported, never raised; sections left with no subsections are dropped. Range endpoints must lie within the
+  span of the messages given to that indexer call (they may cross skipped ids).
+- Leftover uncovered messages go into `"(auto) Unindexed messages"` subsections (<= 6 nearby messages each)
+  whose summaries list the tool calls they contain (e.g. `read_file({"path": ...})`), so they stay findable.
+- "Unindexed" = EVERY transcript message before the new tail that is not covered, not synthetic and not a pure
+  fetch copy -- not just the head -- so messages the agent's hard-cap fallback dropped are indexed too.
+  Messages that carry only `fetch_messages` results are skipped entirely; in any other message (a hand-built
+  mixed one) only fetch bodies are replaced by `RETRIEVED_OMITTED`. `read_index` result bodies are shown to the
+  indexer as `[index listing omitted]`. Fetch output applies the same rules.
+- Index messages longer than the indexer budget are cut per message; the unindexed messages are split into
+  chunks so each indexer request stays under `max_indexer_input_tokens` (60k); chunks run sequentially, each
+  seeing the updated index. Indexer calls use `purpose="compactor"` (same ledger bucket as summary).
+- The indexer prompt ends with the lines `Messages to index (...)` and `Ids to index: m0002, m0003, ...`
+  (scripted/mock indexers may parse the latter).
+- `fetch_messages` also accepts raw message ids/ranges (`"m0012"`, `"m0012-m0015"`); a bare string is accepted
+  in place of the list; unknown ids are listed with the valid ids. Overlapping requests are de-duplicated and
+  each subsection is shown under a `=== N.M summary (section title)  [ranges] ===` header.
+- Resume notice also names the first task message id (`m0001`) so the agent can re-fetch its instructions. If
+  the rendered index exceeds `max_index_frac` (30%) of the cap, the notice shows it abbreviated (truncated
+  summaries, then section-only) and points to `read_index`.
+- Persistence hook: `CompactionStrategy.transcript_path` (class attr, default None) is set by `Agent.__init__`
+  before `bind()`. The indexed strategy writes `index.md` + `index.json` next to the transcript after every
+  compaction (`<stem>.index.md/json` when `transcript_name` is not `transcript.jsonl`).
+- `split_tail` now steps back repeatedly while the cut lands on a user tool_result message (a turn's results
+  can span two user messages since fetch results are stored separately).
+- Event detail keys: `indexed_messages, skipped_retrieved, indexer_calls, sections_added, subsections_added,
+  edits, extends, op_errors, op_error_examples, indexer_failures, auto_covered, indexer_input_tokens,
+  indexer_output_tokens, index_sections, index_subsections, index_tokens, fetch_calls_so_far, tail_start`.
+  The strategy also counts `fetch_calls` / `fetched_tokens` as attributes.
+
+### Eval runner / report / mock (`eval/runner.py`, `eval/report.py`, `eval/mock_llm.py`)
+- Layout: `<out>/runs/<run_name>/{config.json,results.jsonl,report.md,*.png,<task>__<strategy>__r<k>/transcript.jsonl}`.
+  `--seeds K` means K replicates per (task, strategy); tasks use seeds `base_seed .. base_seed+tasks-1`.
+  Resume key is `(task_id, strategy, rep)`. Work order is replicate > task > strategy (interleaved).
+- Phase-2 forcing: `PhaseGuardEnv` wraps the environment and calls `begin_phase2()` once
+  `max_steps - 15` steps have been polled (rows record `phase2_forced`).
+- Budget: stop launching when running total (including cost of resumed rows) >= `--budget-usd`; in-flight runs finish.
+- Rows add per-question `evidence`, `staleness`, `evidence_fetched` (all evidence paths appear in retrieved
+  messages; best effort), `fetch_calls` / `retrieved_tokens` from the transcript, and `index_stats` from the strategy.
+- Strategy kwargs: summary gets `model=compactor_model`, indexed gets `indexer_model=compactor_model`.
+- `MockLLM(task, strategy)` subclasses `ScriptedLLM`. Per-strategy forgetfulness (`MOCK_PROFILES`: truncate forgets
+  early + 10% errors, summary 30% errors, indexed perfect) is arbitrary: mock results are PLUMBING TESTS, not findings,
+  and reports/charts are labelled so. The mock indexer returns valid ops (dropping some ids on even calls to exercise
+  auto-coverage); the indexed mock agent calls `fetch_messages(["1"])` once before submitting.
+- Report: stderr is over runs (accuracy/cost) or over questions (by-tag / staleness / fetched tables).
+  Staleness buckets: 0-8k, 8-16k, 16-24k, 24k+ tokens; unread-evidence questions excluded.
