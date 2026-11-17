@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import sys
 import threading
 import time
@@ -349,6 +350,11 @@ def main(argv: list[str] | None = None) -> int:
     # Load ANTHROPIC_API_KEY (and other settings) from a git-ignored .env file
     # in the current directory, without overriding variables already exported.
     load_dotenv(override=False)
+    # An empty key (e.g. an unedited .env copied from .env.example) would shadow
+    # other credentials such as an `ant auth login` profile, so drop it.
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        if os.environ.get(var, None) == "":
+            del os.environ[var]
     cfg, out = parse_args(argv)
     run_sweep(cfg, out)
     return 0
