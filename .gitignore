@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
-results/runs/*/runs/
+results/runs/mock/
+results/runs/ci/

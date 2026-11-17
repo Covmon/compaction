@@ -1,7 +1,7 @@
 [project]
 name = "compaction"
 version = "0.1.0"
-description = "Add your description here"
+description = "Compares Indexed Retention (a retrieval index for agent context) against summary compaction and truncation under a small context cap."
 readme = "README.md"
 authors = [
     { name = "Claude", email = "noreply@anthropic.com" }
