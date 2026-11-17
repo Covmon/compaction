@@ -5,3 +5,8 @@ __pycache__/
 .ruff_cache/
 results/runs/mock/
 results/runs/ci/
+
+# Secrets
+.env
+.env.*
+!.env.example

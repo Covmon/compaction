@@ -20,6 +20,8 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 from compaction.agent import Agent, AgentConfig
 from compaction.eval.tasks import InvestigationEnvironment, Task, grade, make_tasks
 from compaction.strategies import make_strategy
@@ -344,6 +346,9 @@ def parse_args(argv: list[str] | None = None) -> tuple[RunConfig, Path]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Load ANTHROPIC_API_KEY (and other settings) from a git-ignored .env file
+    # in the current directory, without overriding variables already exported.
+    load_dotenv(override=False)
     cfg, out = parse_args(argv)
     run_sweep(cfg, out)
     return 0

@@ -81,11 +81,12 @@ uv run compaction-eval --mock --tasks 3 --seeds 1 --out results/ --run-name mock
 uv run compaction-report --run results/runs/mock     # make mock; make report RUN=mock
 ```
 
-Real run. Needs `ANTHROPIC_API_KEY` in the environment. This runs the default sweep: 10
-tasks, 3 strategies, 2 replicates.
+Real run. Needs an Anthropic API key: copy `.env.example` to `.env` and paste your key
+there (`.env` is git-ignored; an exported `ANTHROPIC_API_KEY` takes precedence). This runs
+the default sweep: 10 tasks, 3 strategies, 2 replicates.
 
 ```sh
-export ANTHROPIC_API_KEY=...
+cp .env.example .env   # then edit .env and set ANTHROPIC_API_KEY
 uv run compaction-eval --strategies truncate,summary,indexed --tasks 10 --seeds 2 \
   --out results/ --run-name v1 --budget-usd 12
 uv run compaction-report --run results/runs/v1      # make eval RUN=v1; make report RUN=v1
