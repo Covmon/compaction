@@ -159,7 +159,7 @@ def make_report(run_dir: Path) -> Path:
     cfg_path = run_dir / "config.json"
     if cfg_path.exists():
         c = json.loads(cfg_path.read_text())
-        a(f"\nConfig: model `{c.get('model')}`, compactor `{c.get('compactor_model')}`, cap {c.get('context_cap')}, "
+        a(f"\nConfig: provider `{c.get('provider', 'anthropic')}`, model `{c.get('model')}`, compactor `{c.get('compactor_model')}`, cap {c.get('context_cap')}, "
           f"threshold {c.get('threshold')}, keep_last {c.get('keep_last')}, max_steps {c.get('max_steps')}, "
           f"{c.get('tasks')} tasks x {c.get('seeds')} replicate(s).")
     n_err = sum(1 for r in rows if r.get("error"))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import json
 import threading
 import time
 import uuid
@@ -11,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from .context import strip_thinking
+from .context import _result_str, strip_thinking
 from .tokens import estimate_tokens
 
 # (input $/MTok, output $/MTok). Cache reads bill at 10% of input, writes at 125%.
@@ -33,6 +34,9 @@ class LLMResponse:
     output_tokens: int
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    # Cost as billed by the provider (e.g. OpenRouter's usage.cost). When None,
+    # cost is computed from PRICES.
+    billed_usd: float | None = None
 
     @property
     def total_input_tokens(self) -> int:
@@ -81,6 +85,8 @@ def tool_response(
 
 
 def cost_usd(model: str, resp: LLMResponse) -> float:
+    if resp.billed_usd is not None:
+        return resp.billed_usd
     pin, pout = PRICES.get(model, DEFAULT_PRICE)
     return (
         resp.input_tokens * pin
@@ -259,6 +265,163 @@ class AnthropicLLM:
             output_tokens=u.output_tokens or 0,
             cache_read_tokens=getattr(u, "cache_read_input_tokens", 0) or 0,
             cache_write_tokens=getattr(u, "cache_creation_input_tokens", 0) or 0,
+        )
+
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+_FINISH_TO_STOP = {
+    "stop": "end_turn",
+    "length": "max_tokens",
+    "tool_calls": "tool_use",
+    "content_filter": "refusal",
+}
+
+
+def to_openai_tools(tools: list[dict]) -> list[dict]:
+    """Anthropic tool specs -> OpenAI function tools."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema") or {"type": "object"},
+            },
+        }
+        for t in tools
+    ]
+
+
+def to_openai_messages(system: str, messages: list[dict]) -> list[dict]:
+    """Anthropic-style messages -> OpenAI chat messages. tool_use blocks become
+    assistant tool_calls, tool_result blocks become `tool` messages (emitted before
+    any text in the same user turn), and thinking blocks are dropped."""
+    out: list[dict] = [{"role": "system", "content": system}] if system else []
+    for m in messages:
+        content = m["content"]
+        if isinstance(content, str):
+            out.append({"role": m["role"], "content": content})
+            continue
+        texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+        if m["role"] == "assistant":
+            msg: dict[str, Any] = {"role": "assistant", "content": "\n".join(texts) or None}
+            calls = [
+                {
+                    "id": b["id"],
+                    "type": "function",
+                    "function": {"name": b["name"], "arguments": json.dumps(b.get("input") or {})},
+                }
+                for b in content
+                if b.get("type") == "tool_use"
+            ]
+            if calls:
+                msg["tool_calls"] = calls
+            if msg["content"] is not None or calls:
+                out.append(msg)
+            continue
+        for b in content:
+            if b.get("type") == "tool_result":
+                body = _result_str(b)
+                if b.get("is_error"):
+                    body = f"[error] {body}"
+                out.append({"role": "tool", "tool_call_id": b["tool_use_id"], "content": body})
+        if texts:
+            out.append({"role": "user", "content": "\n".join(texts)})
+    return out
+
+
+class OpenAICompatLLM:
+    """OpenAI-compatible chat-completions client (OpenRouter by default), so open-weight
+    models can stand in for Claude. Converts Anthropic-style messages and tools, keeps
+    only the first tool call per response (not every provider honors
+    parallel_tool_calls=false), and uses the provider's billed cost when it reports one.
+    Qwen3-style reasoning is off unless `reasoning=True`: thinking tokens count against
+    max_tokens and would truncate the agent's 2048-token responses."""
+
+    def __init__(
+        self,
+        client: Any = None,
+        *,
+        base_url: str = OPENROUTER_BASE_URL,
+        api_key: str | None = None,
+        reasoning: bool = False,
+        max_retries: int = 6,
+    ) -> None:
+        if client is None:
+            import openai
+
+            client = openai.OpenAI(base_url=base_url, api_key=api_key, max_retries=max_retries)
+        self.client = client
+        self.reasoning = reasoning
+        self.openrouter = "openrouter.ai" in base_url
+        self.usage = UsageLedger()
+
+    def create(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        max_tokens: int = 4096,
+        purpose: str = "agent",
+        output_format: dict | None = None,
+    ) -> LLMResponse:
+        kw: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": to_openai_messages(system, messages),
+        }
+        if tools:
+            kw["tools"] = to_openai_tools(tools)
+        if output_format is not None:
+            kw["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "output", "schema": output_format},
+            }
+        if self.openrouter:
+            kw["extra_body"] = {
+                # Route only to endpoints that support every parameter we send
+                # (tools, response_format), rather than silently dropping them.
+                "provider": {"require_parameters": True},
+                "reasoning": {"enabled": self.reasoning, "exclude": True},
+                "usage": {"include": True},
+            }
+        resp = self._convert(self.client.chat.completions.create(**kw))
+        self.usage.record(purpose, model, resp)
+        return resp
+
+    @staticmethod
+    def _convert(completion: Any) -> LLMResponse:
+        choice = completion.choices[0]
+        msg = choice.message
+        blocks: list[dict] = []
+        if msg.content:
+            blocks.append({"type": "text", "text": msg.content})
+        calls = msg.tool_calls or []
+        if calls:
+            c = calls[0]
+            try:
+                args = json.loads(c.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {"_unparseable_arguments": c.function.arguments}
+            blocks.append(
+                {"type": "tool_use", "id": c.id, "name": c.function.name, "input": args}
+            )
+        stop = "tool_use" if calls else _FINISH_TO_STOP.get(choice.finish_reason, "end_turn")
+        u = completion.usage
+        prompt = (u.prompt_tokens or 0) if u else 0
+        details = getattr(u, "prompt_tokens_details", None)
+        cached = (getattr(details, "cached_tokens", 0) or 0) if details else 0
+        billed = (getattr(u, "model_extra", None) or {}).get("cost") if u else None
+        return LLMResponse(
+            content=blocks,
+            stop_reason=stop,
+            input_tokens=prompt - cached,
+            output_tokens=(u.completion_tokens or 0) if u else 0,
+            cache_read_tokens=cached,
+            billed_usd=float(billed) if billed is not None else None,
         )
 
 
