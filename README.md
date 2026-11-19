@@ -96,6 +96,20 @@ uv run compaction-eval --strategies truncate,summary,indexed --tasks 10 --seeds 
 uv run compaction-report --run results/runs/v1      # make eval RUN=v1; make report RUN=v1
 ```
 
+Open-weight models via [OpenRouter](https://openrouter.ai). Claude models are post-trained
+for very long contexts, so a 16k cap is far below what they expect. To test a small model
+trained for a short window, set `OPENROUTER_API_KEY` in `.env` and run, for example, Qwen3 14B
+(32k native context) as both agent and compactor:
+
+```sh
+uv run compaction-eval --provider openrouter --model qwen/qwen3-14b \
+  --compactor-model qwen/qwen3-14b --tasks 10 --seeds 2 --out results/ --run-name qwen14b
+```
+
+The client keeps only the first tool call per response, routes only to endpoints that
+support tools and structured output, and records OpenRouter's billed cost. Thinking mode
+is off unless you pass `--reasoning`.
+
 Useful flags for `compaction-eval`: `--workers` (thread pool, default 4), `--max-steps`
 (default 150), `--context-cap` (default 16000), `--threshold` (default 0.8),
 `--keep-last` (default 4), `--base-seed`, `--model`, `--compactor-model`. The runner is

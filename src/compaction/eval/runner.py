@@ -52,6 +52,8 @@ class RunConfig:
     budget_usd: float = 12.0
     mock: bool = False
     run_name: str = "run"
+    provider: str = "anthropic"  # "anthropic" or "openrouter"
+    reasoning: bool = False  # openrouter only: let the model think before answering
 
 
 @dataclasses.dataclass(frozen=True)
@@ -112,6 +114,13 @@ def build_llm(cfg: RunConfig, task: Task, strategy: str):
         from compaction.eval.mock_llm import MockLLM
 
         return MockLLM(task, strategy)
+    if cfg.provider == "openrouter":
+        from compaction.llm import OpenAICompatLLM
+
+        key = os.environ.get("OPENROUTER_API_KEY")
+        if not key:
+            raise RuntimeError("--provider openrouter needs OPENROUTER_API_KEY (in .env or exported)")
+        return OpenAICompatLLM(api_key=key, reasoning=cfg.reasoning)
     from compaction.llm import AnthropicLLM
 
     return AnthropicLLM()
@@ -161,7 +170,7 @@ def run_one(job: Job, task: Task, cfg: RunConfig, run_dir: Path) -> dict:
         "config": {
             k: getattr(cfg, k)
             for k in ("model", "compactor_model", "context_cap", "threshold",
-                      "keep_last", "max_steps")
+                      "keep_last", "max_steps", "provider", "reasoning")
         },
         "score": 0.0,
         "error": None,
@@ -334,6 +343,10 @@ def parse_args(argv: list[str] | None = None) -> tuple[RunConfig, Path]:
     p.add_argument("--mock", action="store_true")
     p.add_argument("--run-name", default=None)
     p.add_argument("--budget-usd", type=float, default=12.0)
+    p.add_argument("--provider", choices=["anthropic", "openrouter"], default="anthropic",
+                   help="openrouter: open-weight models via OpenRouter, e.g. --model qwen/qwen3-14b")
+    p.add_argument("--reasoning", action="store_true",
+                   help="openrouter only: enable the model's thinking mode (off by default)")
     a = p.parse_args(argv)
     name = a.run_name or ("mock" if a.mock else datetime.now().strftime("run-%Y%m%d-%H%M%S"))
     cfg = RunConfig(
@@ -342,6 +355,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[RunConfig, Path]:
         compactor_model=a.compactor_model, context_cap=a.context_cap,
         threshold=a.threshold, keep_last=a.keep_last, max_steps=a.max_steps,
         workers=a.workers, budget_usd=a.budget_usd, mock=a.mock, run_name=name,
+        provider=a.provider, reasoning=a.reasoning,
     )
     return cfg, Path(a.out)
 
@@ -352,7 +366,7 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(override=False)
     # An empty key (e.g. an unedited .env copied from .env.example) would shadow
     # other credentials such as an `ant auth login` profile, so drop it.
-    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+    for var in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENROUTER_API_KEY"):
         if os.environ.get(var, None) == "":
             del os.environ[var]
     cfg, out = parse_args(argv)
